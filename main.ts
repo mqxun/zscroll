@@ -7,16 +7,62 @@ interface ZscrollSettings {
   minZoom: number;
   /** Largest allowed zoom factor. */
   maxZoom: number;
+  /** Whether to flash the zoom-percentage indicator on change. */
+  showIndicator: boolean;
 }
 
 const DEFAULT_SETTINGS: ZscrollSettings = {
   zoomStep: 0.1,
   minZoom: 0.3,
   maxZoom: 5.0,
+  showIndicator: true,
 };
 
-/** Markdown leaf content elements whose `.view-content` we may scale. */
-const MARKDOWN_LEAF_SELECTOR = '.workspace-leaf-content[data-type="markdown"]';
+/** The markdown view-content wrapper (inside a `.workspace-leaf`) whose child we scale. */
+const MARKDOWN_CONTENT_SELECTOR = '.workspace-leaf-content[data-type="markdown"]';
+
+/** How long the zoom indicator stays visible after the last change, in ms. */
+const INDICATOR_HIDE_DELAY = 900;
+
+/**
+ * A small fading badge that shows the current zoom percentage in the top-right corner of
+ * the pane being zoomed. Lives on `document.body` (not inside the scaled content) so it is
+ * never itself transformed. Owns a `setTimeout`, so callers must `destroy()` it on unload.
+ */
+class ZoomIndicator {
+  private readonly el: HTMLElement;
+  private hideTimer: number | null = null;
+
+  constructor() {
+    this.el = document.body.createDiv({ cls: "zscroll-indicator" });
+  }
+
+  /** Flash `text` at the top-right of `anchor` (the pane), then fade out. */
+  show(text: string, anchor: HTMLElement): void {
+    this.el.setText(text);
+
+    const rect = anchor.getBoundingClientRect();
+    this.el.style.top = `${rect.top + 16}px`;
+    this.el.style.right = `${window.innerWidth - rect.right + 16}px`;
+    this.el.addClass("is-visible");
+
+    if (this.hideTimer !== null) {
+      window.clearTimeout(this.hideTimer);
+    }
+    this.hideTimer = window.setTimeout(() => {
+      this.el.removeClass("is-visible");
+      this.hideTimer = null;
+    }, INDICATOR_HIDE_DELAY);
+  }
+
+  destroy(): void {
+    if (this.hideTimer !== null) {
+      window.clearTimeout(this.hideTimer);
+      this.hideTimer = null;
+    }
+    this.el.remove();
+  }
+}
 
 export default class ZscrollPlugin extends Plugin {
   settings: ZscrollSettings = DEFAULT_SETTINGS;
@@ -28,9 +74,12 @@ export default class ZscrollPlugin extends Plugin {
    */
   private readonly scaled = new Map<HTMLElement, number>();
 
+  private indicator: ZoomIndicator | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
 
+    this.indicator = new ZoomIndicator();
     this.addSettingTab(new ZscrollSettingTab(this.app, this));
 
     // Capture phase + non-passive: we must run before the editor and be allowed to
@@ -52,6 +101,8 @@ export default class ZscrollPlugin extends Plugin {
       this.clearZoom(el);
     }
     this.scaled.clear();
+    this.indicator?.destroy();
+    this.indicator = null;
   }
 
   private readonly onWheel = (evt: WheelEvent): void => {
@@ -59,8 +110,8 @@ export default class ZscrollPlugin extends Plugin {
       return; // Plain scroll — leave it alone.
     }
 
-    const el = this.resolveContentEl(evt.target);
-    if (!el) {
+    const target = this.resolveTarget(evt.target);
+    if (!target) {
       return;
     }
 
@@ -68,26 +119,43 @@ export default class ZscrollPlugin extends Plugin {
     evt.preventDefault();
     evt.stopPropagation();
 
-    const current = this.scaled.get(el) ?? 1;
+    const { pane, content } = target;
+    const current = this.scaled.get(content) ?? 1;
     const direction = evt.deltaY < 0 ? 1 : -1; // wheel up = zoom in
     const next = this.clampZoom(current + direction * this.settings.zoomStep);
 
-    if (next === current) {
-      return;
+    // Show feedback even when clamped at a limit, but only re-apply on an actual change.
+    this.flashIndicator(next, pane);
+    if (next !== current) {
+      this.applyZoom(content, next);
     }
-    this.applyZoom(el, next);
   };
 
-  /** Find the scalable `.view-content` of the markdown leaf under the event target. */
-  private resolveContentEl(target: EventTarget | null): HTMLElement | null {
+  /**
+   * Resolve the markdown pane under the event target along with its scalable
+   * `.view-content`. The pane element is unscaled, so it anchors the indicator correctly.
+   */
+  private resolveTarget(
+    target: EventTarget | null
+  ): { pane: HTMLElement; content: HTMLElement } | null {
     if (!(target instanceof HTMLElement)) {
       return null;
     }
-    const leaf = target.closest(MARKDOWN_LEAF_SELECTOR);
-    if (!leaf) {
+    const pane = target.closest<HTMLElement>(".workspace-leaf");
+    const content = pane
+      ?.querySelector(MARKDOWN_CONTENT_SELECTOR)
+      ?.querySelector<HTMLElement>(".view-content");
+    if (!pane || !content) {
       return null;
     }
-    return leaf.querySelector<HTMLElement>(".view-content");
+    return { pane, content };
+  }
+
+  /** Flash the zoom percentage on the given pane, when the indicator is enabled. */
+  private flashIndicator(factor: number, pane: HTMLElement): void {
+    if (this.settings.showIndicator) {
+      this.indicator?.show(`${Math.round(factor * 100)}%`, pane);
+    }
   }
 
   /** Round (to curb float drift) and clamp into the configured zoom range. */
@@ -120,11 +188,16 @@ export default class ZscrollPlugin extends Plugin {
 
   private resetActiveZoom(): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const el = view?.containerEl.querySelector<HTMLElement>(".view-content");
+    if (!view) {
+      return;
+    }
+    const el = view.containerEl.querySelector<HTMLElement>(".view-content");
     if (el) {
       this.clearZoom(el);
       this.scaled.delete(el);
     }
+    // Anchor the badge to the view container itself (avoids reverse-walking the DOM).
+    this.flashIndicator(1, view.containerEl);
   }
 
   async loadSettings(): Promise<void> {
@@ -193,6 +266,18 @@ class ZscrollSettingTab extends PluginSettingTab {
               this.plugin.settings.maxZoom = parsed;
               await this.plugin.saveSettings();
             }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Show zoom indicator")
+      .setDesc("Flash the current zoom percentage in the top-right of the pane on change.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showIndicator)
+          .onChange(async (value) => {
+            this.plugin.settings.showIndicator = value;
+            await this.plugin.saveSettings();
           })
       );
   }
