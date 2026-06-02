@@ -1,5 +1,13 @@
 import { App, MarkdownView, Plugin, PluginSettingTab, Setting } from "obsidian";
 
+/** Which corner of the active pane the zoom indicator is anchored to. */
+const INDICATOR_CORNERS = ["top-left", "top-right", "bottom-left", "bottom-right"] as const;
+type IndicatorCorner = (typeof INDICATOR_CORNERS)[number];
+
+function isIndicatorCorner(value: string): value is IndicatorCorner {
+  return (INDICATOR_CORNERS as readonly string[]).includes(value);
+}
+
 interface ZscrollSettings {
   /** How much each wheel notch changes the zoom factor. */
   zoomStep: number;
@@ -9,6 +17,12 @@ interface ZscrollSettings {
   maxZoom: number;
   /** Whether to flash the zoom-percentage indicator on change. */
   showIndicator: boolean;
+  /** Corner of the active pane the indicator is anchored to. */
+  indicatorCorner: IndicatorCorner;
+  /** Horizontal gap (px) from the chosen corner. */
+  indicatorOffsetX: number;
+  /** Vertical gap (px) from the chosen corner. */
+  indicatorOffsetY: number;
 }
 
 const DEFAULT_SETTINGS: ZscrollSettings = {
@@ -16,7 +30,17 @@ const DEFAULT_SETTINGS: ZscrollSettings = {
   minZoom: 0.3,
   maxZoom: 5.0,
   showIndicator: true,
+  indicatorCorner: "top-right",
+  indicatorOffsetX: 20,
+  indicatorOffsetY: 40,
 };
+
+/** Where to place the indicator: a corner plus px offsets from it. */
+interface IndicatorPosition {
+  corner: IndicatorCorner;
+  offsetX: number;
+  offsetY: number;
+}
 
 /** The markdown view-content wrapper (inside a `.workspace-leaf`) whose child we scale. */
 const MARKDOWN_CONTENT_SELECTOR = '.workspace-leaf-content[data-type="markdown"]';
@@ -25,25 +49,27 @@ const MARKDOWN_CONTENT_SELECTOR = '.workspace-leaf-content[data-type="markdown"]
 const INDICATOR_HIDE_DELAY = 900;
 
 /**
- * A small fading badge that shows the current zoom percentage in the top-right corner of
- * the pane being zoomed. Lives on `document.body` (not inside the scaled content) so it is
- * never itself transformed. Owns a `setTimeout`, so callers must `destroy()` it on unload.
+ * A small fading badge that shows the current zoom percentage in a chosen corner of the
+ * pane being zoomed (a muted "zoom:" label over the accent-colored percentage). Lives on
+ * `document.body` (not inside the scaled content) so it is never itself transformed. Owns a
+ * `setTimeout` and a DOM element, so callers must `destroy()` it on unload to clear the
+ * timer and remove the element.
  */
 class ZoomIndicator {
   private readonly el: HTMLElement;
+  private readonly valueEl: HTMLElement;
   private hideTimer: number | null = null;
 
   constructor() {
     this.el = document.body.createDiv({ cls: "zscroll-indicator" });
+    this.el.createDiv({ cls: "zscroll-indicator-label", text: "Zoom:" });
+    this.valueEl = this.el.createDiv({ cls: "zscroll-indicator-value" });
   }
 
-  /** Flash `text` at the top-right of `anchor` (the pane), then fade out. */
-  show(text: string, anchor: HTMLElement): void {
-    this.el.setText(text);
-
-    const rect = anchor.getBoundingClientRect();
-    this.el.style.top = `${rect.top + 16}px`;
-    this.el.style.right = `${window.innerWidth - rect.right + 16}px`;
+  /** Flash `text` at the configured corner of `anchor` (the pane), then fade out. */
+  show(text: string, anchor: HTMLElement, pos: IndicatorPosition): void {
+    this.valueEl.setText(text);
+    this.position(anchor, pos);
     this.el.addClass("is-visible");
 
     if (this.hideTimer !== null) {
@@ -53,6 +79,24 @@ class ZoomIndicator {
       this.el.removeClass("is-visible");
       this.hideTimer = null;
     }, INDICATOR_HIDE_DELAY);
+  }
+
+  private position(anchor: HTMLElement, pos: IndicatorPosition): void {
+    const rect = anchor.getBoundingClientRect();
+    // Clear all edges first so a corner change never leaves a stale one set.
+    for (const edge of ["top", "bottom", "left", "right"] as const) {
+      this.el.style.removeProperty(edge);
+    }
+    if (pos.corner.startsWith("top")) {
+      this.el.style.top = `${rect.top + pos.offsetY}px`;
+    } else {
+      this.el.style.bottom = `${window.innerHeight - rect.bottom + pos.offsetY}px`;
+    }
+    if (pos.corner.endsWith("left")) {
+      this.el.style.left = `${rect.left + pos.offsetX}px`;
+    } else {
+      this.el.style.right = `${window.innerWidth - rect.right + pos.offsetX}px`;
+    }
   }
 
   destroy(): void {
@@ -154,7 +198,11 @@ export default class ZscrollPlugin extends Plugin {
   /** Flash the zoom percentage on the given pane, when the indicator is enabled. */
   private flashIndicator(factor: number, pane: HTMLElement): void {
     if (this.settings.showIndicator) {
-      this.indicator?.show(`${Math.round(factor * 100)}%`, pane);
+      this.indicator?.show(`${Math.round(factor * 100)}%`, pane, {
+        corner: this.settings.indicatorCorner,
+        offsetX: this.settings.indicatorOffsetX,
+        offsetY: this.settings.indicatorOffsetY,
+      });
     }
   }
 
@@ -271,13 +319,65 @@ class ZscrollSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Show zoom indicator")
-      .setDesc("Flash the current zoom percentage in the top-right of the pane on change.")
+      .setDesc("Flash the current zoom percentage on the pane when the zoom changes.")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.showIndicator)
           .onChange(async (value) => {
             this.plugin.settings.showIndicator = value;
             await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Indicator corner")
+      .setDesc("Which corner of the active pane the indicator is anchored to.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            "top-left": "Top left",
+            "top-right": "Top right",
+            "bottom-left": "Bottom left",
+            "bottom-right": "Bottom right",
+          })
+          .setValue(this.plugin.settings.indicatorCorner)
+          .onChange(async (value) => {
+            if (isIndicatorCorner(value)) {
+              this.plugin.settings.indicatorCorner = value;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Horizontal offset (px)")
+      .setDesc("Gap from the chosen corner along the horizontal edge.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.indicatorOffsetX))
+          .setValue(String(this.plugin.settings.indicatorOffsetX))
+          .onChange(async (value) => {
+            const parsed = Number.parseFloat(value);
+            if (Number.isFinite(parsed) && parsed >= 0) {
+              this.plugin.settings.indicatorOffsetX = parsed;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Vertical offset (px)")
+      .setDesc("Gap from the chosen corner along the vertical edge.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.indicatorOffsetY))
+          .setValue(String(this.plugin.settings.indicatorOffsetY))
+          .onChange(async (value) => {
+            const parsed = Number.parseFloat(value);
+            if (Number.isFinite(parsed) && parsed >= 0) {
+              this.plugin.settings.indicatorOffsetY = parsed;
+              await this.plugin.saveSettings();
+            }
           })
       );
   }

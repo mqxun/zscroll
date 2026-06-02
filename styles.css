@@ -4,17 +4,20 @@
   transition: transform 60ms ease-out;
 }
 
-/* Zoom-percentage badge, flashed in the top-right of the pane being zoomed.
-   Positioned inline by the plugin; lives on document.body so it is never scaled. */
+/* Zoom badge, flashed in a configurable corner of the pane being zoomed: a muted "zoom:"
+   label over the accent-colored percentage. The corner/offset (top/right/bottom/left) are
+   set inline by the plugin; it lives on document.body so it is never scaled. */
 .zscroll-indicator {
   position: fixed;
   z-index: var(--layer-popover);
-  padding: 4px 10px;
-  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 6px 12px;
+  border-radius: 10px;
   background: var(--background-secondary-alt);
-  color: var(--text-normal);
-  font-size: var(--font-ui-small);
-  line-height: 1;
+  border: 1px solid var(--background-modifier-border);
   box-shadow: var(--shadow-s);
   opacity: 0;
   pointer-events: none;
@@ -23,4 +26,18 @@
 
 .zscroll-indicator.is-visible {
   opacity: 1;
+}
+
+.zscroll-indicator-label {
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.zscroll-indicator-value {
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-bold);
+  color: var(--text-accent);
+  line-height: 1;
 }
