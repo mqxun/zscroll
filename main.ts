@@ -1,4 +1,11 @@
-import { App, MarkdownView, Plugin, PluginSettingTab, Setting } from "obsidian";
+import {
+  App,
+  ButtonComponent,
+  MarkdownView,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+} from "obsidian";
 
 /** Which corner of the active pane the zoom indicator is anchored to. */
 const INDICATOR_CORNERS = ["top-left", "top-right", "bottom-left", "bottom-right"] as const;
@@ -8,7 +15,38 @@ function isIndicatorCorner(value: string): value is IndicatorCorner {
   return (INDICATOR_CORNERS as readonly string[]).includes(value);
 }
 
+/**
+ * Collapse a modifier's Left/Right variant to its family name ("ControlLeft" → "Control"),
+ * passing other codes through. Modifiers are stored as the family so either physical key
+ * matches and the authoritative flag can be read off the wheel event; any other trigger key
+ * is stored as its raw `KeyboardEvent.code` (e.g. "KeyZ") and matched against held-key state.
+ */
+function normalizeTriggerKey(code: string): string {
+  const match = /^(Control|Alt|Shift|Meta)(Left|Right)$/.exec(code);
+  return match ? match[1] : code;
+}
+
+/** Human-readable label for a stored trigger key, for the settings button. */
+function formatKeyLabel(key: string): string {
+  switch (key) {
+    case "Control":
+      return "Ctrl";
+    case "Meta":
+      return "Cmd/Win";
+    case "Alt":
+    case "Shift":
+      return key;
+    default:
+      return key.replace(/^(Key|Digit)/, "") || key;
+  }
+}
+
 interface ZscrollSettings {
+  /**
+   * Key that must be held while scrolling to zoom. A modifier family name
+   * ("Control" | "Alt" | "Shift" | "Meta") or a raw `KeyboardEvent.code` (e.g. "KeyZ").
+   */
+  triggerKey: string;
   /** How much each wheel notch changes the zoom factor. */
   zoomStep: number;
   /** Smallest allowed zoom factor. */
@@ -26,6 +64,7 @@ interface ZscrollSettings {
 }
 
 const DEFAULT_SETTINGS: ZscrollSettings = {
+  triggerKey: "Control",
   zoomStep: 0.1,
   minZoom: 0.3,
   maxZoom: 5.0,
@@ -120,6 +159,12 @@ export default class ZscrollPlugin extends Plugin {
 
   private indicator: ZoomIndicator | null = null;
 
+  /**
+   * Physical keys (`KeyboardEvent.code`) currently held down. Only consulted for
+   * non-modifier triggers — modifiers are read off the wheel event flags directly.
+   */
+  private readonly pressedKeys = new Set<string>();
+
   async onload(): Promise<void> {
     await this.loadSettings();
 
@@ -133,6 +178,12 @@ export default class ZscrollPlugin extends Plugin {
       capture: true,
     });
 
+    // Track held keys so an arbitrary (non-modifier) trigger key can gate zooming.
+    this.registerDomEvent(document, "keydown", this.onKeyDown, { capture: true });
+    this.registerDomEvent(document, "keyup", this.onKeyUp, { capture: true });
+    // Window blur can swallow the keyup; clear state so a key can't get stuck "held".
+    this.registerDomEvent(window, "blur", this.onBlur);
+
     this.addCommand({
       id: "reset-zoom",
       name: "Reset zoom of active note",
@@ -145,12 +196,42 @@ export default class ZscrollPlugin extends Plugin {
       this.clearZoom(el);
     }
     this.scaled.clear();
+    this.pressedKeys.clear();
     this.indicator?.destroy();
     this.indicator = null;
   }
 
+  private readonly onKeyDown = (evt: KeyboardEvent): void => {
+    this.pressedKeys.add(evt.code);
+  };
+
+  private readonly onKeyUp = (evt: KeyboardEvent): void => {
+    this.pressedKeys.delete(evt.code);
+  };
+
+  private readonly onBlur = (): void => {
+    this.pressedKeys.clear();
+  };
+
+  /** Whether the configured trigger key is held for this wheel event. */
+  private triggerHeld(evt: WheelEvent): boolean {
+    const key = this.settings.triggerKey;
+    switch (key) {
+      case "Control":
+        return evt.ctrlKey;
+      case "Alt":
+        return evt.altKey;
+      case "Shift":
+        return evt.shiftKey;
+      case "Meta":
+        return evt.metaKey;
+      default:
+        return this.pressedKeys.has(key);
+    }
+  }
+
   private readonly onWheel = (evt: WheelEvent): void => {
-    if (!evt.ctrlKey) {
+    if (!this.triggerHeld(evt)) {
       return; // Plain scroll — leave it alone.
     }
 
@@ -265,9 +346,21 @@ class ZscrollSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  /** The in-flight one-shot keydown listener while capturing, or null when idle. */
+  private pendingCapture: ((evt: KeyboardEvent) => void) | null = null;
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    this.cancelCapture();
+
+    new Setting(containerEl)
+      .setName("Zoom trigger key")
+      .setDesc("Hold this key while scrolling to zoom. Click, then press the key to use.")
+      .addButton((button) => {
+        button.setButtonText(formatKeyLabel(this.plugin.settings.triggerKey));
+        button.onClick(() => this.captureTriggerKey(button));
+      });
 
     new Setting(containerEl)
       .setName("Zoom step")
@@ -380,5 +473,49 @@ class ZscrollSettingTab extends PluginSettingTab {
             }
           })
       );
+  }
+
+  /**
+   * Record the next keypress as the zoom trigger key. The capture listener is transient
+   * (not a plugin-lifecycle one): it is removed when it fires, and `cancelCapture` tears
+   * down any still-pending one when the tab is re-rendered or closed, so it never leaks.
+   */
+  private captureTriggerKey(button: ButtonComponent): void {
+    if (this.pendingCapture) {
+      return;
+    }
+    button.setButtonText("Press a key… (Esc to cancel)");
+
+    const onKey = (evt: KeyboardEvent): void => {
+      evt.preventDefault();
+      // Let Escape still bubble (e.g. to close a modal); only swallow real key picks.
+      if (evt.key !== "Escape") {
+        evt.stopPropagation();
+      }
+      this.cancelCapture();
+      if (evt.key === "Escape") {
+        button.setButtonText(formatKeyLabel(this.plugin.settings.triggerKey));
+        return;
+      }
+      const key = normalizeTriggerKey(evt.code);
+      this.plugin.settings.triggerKey = key;
+      button.setButtonText(formatKeyLabel(key));
+      void this.plugin.saveSettings();
+    };
+
+    this.pendingCapture = onKey;
+    document.addEventListener("keydown", onKey, true);
+  }
+
+  /** Tear down any in-flight trigger-key capture listener. */
+  private cancelCapture(): void {
+    if (this.pendingCapture) {
+      document.removeEventListener("keydown", this.pendingCapture, true);
+      this.pendingCapture = null;
+    }
+  }
+
+  hide(): void {
+    this.cancelCapture();
   }
 }
