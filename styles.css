@@ -1,0 +1,5 @@
+/* zscroll — smooth visual zoom on the active note pane.
+   The transform itself is applied inline by the plugin; this just softens the change. */
+.workspace-leaf-content[data-type="markdown"] .view-content {
+  transition: transform 60ms ease-out;
+}

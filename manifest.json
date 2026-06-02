@@ -1,0 +1,9 @@
+{
+  "id": "zscroll",
+  "name": "Zscroll",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Zoom the active note pane in and out with Ctrl + mouse wheel.",
+  "author": "k.wendt",
+  "isDesktopOnly": true
+}
